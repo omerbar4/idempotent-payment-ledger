@@ -1,10 +1,26 @@
 # Idempotent Payment Ledger API
 
-A small payment ledger REST API built with **Java 21, Spring Boot 3.5, PostgreSQL 16, Spring Data JPA and Flyway**.
-It has two guarantees:
+A payment ledger REST API built with **Java 21, Spring Boot 3.5, PostgreSQL 16, Spring Data JPA and Flyway**. It records payments and refunds between accounts as double-entry postings. Its correctness guarantees are enforced by PostgreSQL itself (a unique constraint, row locks, CHECK constraints and a deferred trigger), not by in-memory checks. They are verified by Testcontainers integration tests, a k6 load test followed by a SQL invariant check, and a container restart/recovery script.
 
-1. **A request is applied at most once.** Retries with the same `Idempotency-Key` never create a second transaction, even when the requests arrive concurrently.
-2. **The books always balance.** Every posted transaction writes an equal debit and credit, and PostgreSQL rejects any commit that breaks this.
+**Guarantees**
+
+1. **A request is applied at most once.** Retries with the same `Idempotency-Key` never create a second transaction. The key is claimed with `INSERT … ON CONFLICT DO NOTHING` in the same database transaction as the ledger writes, so it survives API restarts.
+2. **Concurrent duplicates collapse to one.** When identical requests race, exactly one creates the transaction and the rest replay it. Parallel payments never overdraw an account, and a payment can be refunded only once.
+3. **The books always balance.** Every posted transaction writes an equal debit and credit, and PostgreSQL rejects any commit that breaks this.
+
+**Quick start** (needs Docker only):
+
+```bash
+docker compose up -d --build --wait            # PostgreSQL + API on 127.0.0.1
+curl -s localhost:8080/actuator/health          # {"status":"UP", ... "db":{"status":"UP"} ...}
+docker compose down                             # stop (add -v to also delete this project's data)
+```
+
+Swagger UI is then at http://localhost:8080/swagger-ui.html. If port 5432 or 8080 is taken, set `POSTGRES_PORT` / `API_PORT`; see [Running locally](#running-locally).
+
+**Documentation:** [RUNBOOK.md](RUNBOOK.md) covers operations, the load test, the recovery check and an interview demo. [docs/MEASUREMENT_REPORT.md](docs/MEASUREMENT_REPORT.md) has the reproducible test and latency evidence. [docs/PUBLISH_CHECKLIST.md](docs/PUBLISH_CHECKLIST.md) is the release checklist. [FINAL_PROJECT_REPORT.md](FINAL_PROJECT_REPORT.md) is the full engineering report.
+
+> **Scope:** this is a portfolio project that has been validated locally and in containers. It is not deployed, not production-operated, and its load-test figures are not a capacity benchmark.
 
 ## Architecture
 
@@ -99,7 +115,7 @@ curl -s localhost:8080/accounts -H 'Content-Type: application/json' \
 
 # Create a payment. Re-running this exact command returns the same transaction with 200 + Idempotent-Replayed: true
 curl -i localhost:8080/transactions \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: 7f1c2d9e-order-1234' \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: order-1001' \
   -d '{"sourceAccountId":"<FUNDING_ID>","destinationAccountId":"<ALICE_ID>","amount":"100.00","currency":"USD","description":"Top-up"}'
 ```
 
@@ -148,8 +164,10 @@ Ports are configurable: `POSTGRES_PORT` defaults to 5432 and `API_PORT` to 8080.
 ## Running tests
 
 ```bash
-./mvnw verify
+./mvnw clean verify
 ```
+
+Continuous integration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same command (JDK 21, Testcontainers on the runner's Docker) on every push and pull request.
 
 The integration tests use **JUnit 5 + Testcontainers**. They start a throwaway `postgres:16-alpine` container (Docker must be running) and exercise the real HTTP API on a random port. They cover:
 
@@ -162,7 +180,7 @@ The integration tests use **JUnit 5 + Testcontainers**. They start a throwaway `
 
 ## Operational validation
 
-Three things are layered on top of the tests: metrics, a k6 load test, and a Docker restart/recovery check. **[RUNBOOK.md](RUNBOOK.md)** has the exact commands, expected output and a 5–10 minute demo sequence.
+Three things are layered on top of the tests: metrics, a k6 load test, and a Docker restart/recovery check. **[RUNBOOK.md](RUNBOOK.md)** has the exact commands, expected output and a 5–10 minute demo sequence. Observed results and how to interpret them are in **[docs/MEASUREMENT_REPORT.md](docs/MEASUREMENT_REPORT.md)**.
 
 | What | Where |
 |---|---|
