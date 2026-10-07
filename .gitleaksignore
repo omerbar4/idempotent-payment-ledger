@@ -1,7 +1,7 @@
 # Reviewed gitleaks false positives (gitleaks reads this file automatically).
 # Each entry is a finding fingerprint (commit:file:rule:line); no secret values are stored here.
 #
-# README.md example request header in commit 56634fe: the value is a sample Idempotency-Key, i.e. a
+# README.md example request header in commit 6d9c098 (the root commit): the value is a sample Idempotency-Key, i.e. a
 # client-chosen request identifier, not a credential. The example was later changed to a value
 # that no longer matches the rule; this entry only covers the historical commit.
-56634fea6621ba30a4daa38f43342a5d5569534a:README.md:generic-api-key:101
+6d9c0984299547af1e4eae9a777e29c3de81f27a:README.md:generic-api-key:101
