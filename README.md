@@ -15,6 +15,7 @@ repository/   Spring Data JPA repositories + one JDBC fragment for INSERT ... ON
 domain/       JPA entities (Account, LedgerTransaction, LedgerEntry), status/type enums, Money
 dto/          Request/response records (amounts serialized as strings)
 exception/    ApiException + GlobalExceptionHandler (RFC 9457 problem+json with a `code` field)
+metrics/      LedgerMetrics: Micrometer counters for transaction outcomes and error codes
 db/migration  Flyway schema: tables, CHECK/UNIQUE constraints, ledger triggers
 ```
 
@@ -133,14 +134,16 @@ Errors use `application/problem+json` with a stable `code`:
 
 ## Running locally
 
-Requirements: JDK 21 and Docker. Maven is provided by the wrapper.
+Requirements: Docker. A JDK 21 is needed only to run Maven on the host; the wrapper supplies Maven itself.
 
 ```bash
-docker compose up -d          # PostgreSQL 16 on localhost:5432 (db/user/password: ledger)
-./mvnw spring-boot:run        # Flyway migrates the schema on startup
+docker compose up -d --build --wait   # PostgreSQL 16 + the API, both published on 127.0.0.1 only
+curl -s localhost:8080/actuator/health
 ```
 
-If port 5432 is taken, run `POSTGRES_PORT=55432 docker compose up -d` and start the app with `DB_URL=jdbc:postgresql://localhost:55432/ledger ./mvnw spring-boot:run`.
+To run the API from your IDE or with Maven instead, start only the database with `docker compose up -d postgres`, then run `./mvnw spring-boot:run`. Flyway migrates the schema on startup.
+
+Ports are configurable: `POSTGRES_PORT` defaults to 5432 and `API_PORT` to 8080. If 5432 is taken, run `POSTGRES_PORT=55432 docker compose up -d postgres` and point a host-run API at it with `DB_URL=jdbc:postgresql://localhost:55432/ledger`.
 
 ## Running tests
 
@@ -154,7 +157,22 @@ The integration tests use **JUnit 5 + Testcontainers**. They start a throwaway `
 - **Concurrency:** 16 parallel payments with the same key produce exactly 1 transaction and 2 entries. 12 parallel refunds with the same key produce 1 refund. 10 parallel refunds with different keys produce 1 success and 9 conflicts. 20 parallel payments against a 100.00 balance produce exactly 10 posted, 10 failed, and a final balance of 0.
 - **Ledger:** balanced entries; account balances equal the sum of their entries; the global sum of debits equals the sum of credits; refund reversal; refund rules.
 - **Database constraints:** an unbalanced insert is rejected at commit; UPDATE and DELETE on entries are rejected; a duplicate key is rejected by `UNIQUE`; an overdraft is rejected by `CHECK`.
+- **Metrics:** transaction counters by outcome, including a concurrent same-key burst (1 `posted`, the rest `replayed`); the Prometheus scrape contains HTTP and ledger metrics but no keys, ids or amounts; health shows the db component plus liveness and readiness probes.
+- **Restart durability:** a payment is created by one application instance, that instance is shut down, and a new instance against the same database replays the request: same id, still 1 row and 2 entries.
+
+## Operational validation
+
+Three things are layered on top of the tests: metrics, a k6 load test, and a Docker restart/recovery check. **[RUNBOOK.md](RUNBOOK.md)** has the exact commands, expected output and a 5–10 minute demo sequence.
+
+| What | Where |
+|---|---|
+| Health and probes | `GET /actuator/health`, `/actuator/health/liveness`, `/actuator/health/readiness` |
+| Prometheus metrics | `GET /actuator/prometheus`: `http_server_requests_seconds_*` (count, latency histogram, status/outcome) plus `ledger_transactions_total{type,outcome}` and `ledger_api_errors_total{code}` |
+| Load test + DB verification | `scripts/load-test.sh` (k6 in Docker, then `scripts/verify-ledger.sh`) |
+| Restart / recovery | `scripts/recovery-check.sh` (isolated Compose project; recreates the API and PostgreSQL containers) |
+
+All of this is local validation. It is not a deployed service and not a capacity benchmark.
 
 ## Deliberate scope limits
 
-No authentication or multi-tenancy, so idempotency keys are global. In production they would be scoped per client and expired after a retention window. Refunds are full refunds only, and there is no currency conversion.
+No authentication or multi-tenancy, so idempotency keys are global. In production they would be scoped per client and expired after a retention window. Refunds are full refunds only, and there is no currency conversion. The actuator endpoints are unauthenticated and served on the application port, which suits local use only.

@@ -1,10 +1,18 @@
 # Idempotent Payment Ledger API: Final Project Report
 
 **Project status: COMPLETED**
-**Final verification date:** 2026-09-30
-**Final result:** 27 / 27 integration tests passed · `BUILD SUCCESS` · runtime smoke test against Docker Compose PostgreSQL passed
+**Final verification date:** 2026-10-07
+**Final result:**
+- 33 / 33 integration tests passed, `BUILD SUCCESS`
+- k6 load test passed: all checks and thresholds, followed by database ledger verification
+- Docker restart/recovery check passed
 
-Everything in this report comes from the code in this repository and from the verification runs recorded in §15.
+Everything in this report comes from the code in this repository and from the verification runs recorded in §15 and §19.
+
+| Revision | Date | Scope |
+|---|---|---|
+| 1.0 | 2026-09-30 | Core API: idempotent payments/refunds, double-entry ledger, DB invariants, 27 integration tests |
+| 1.1 | 2026-10-07 | Operational validation: Actuator health/probes, Prometheus metrics with ledger counters, containerized API, k6 load test with a DB verifier, restart/recovery script, 6 more tests, RUNBOOK.md |
 
 ---
 
@@ -15,7 +23,13 @@ The Idempotent Payment Ledger API is a REST backend that records money movements
 1. **Exactly-once effect per `Idempotency-Key`.** Retries of a request, including concurrent ones, never create a second transaction. This is enforced by a PostgreSQL unique constraint used inside the same database transaction as the ledger writes, not by an in-memory check.
 2. **A ledger that always balances.** Every posted transaction writes an equal debit and credit. PostgreSQL itself rejects unbalanced, mutated or overdrawn ledger state.
 
-Features: account creation, payments, full refunds, transaction lookup with ledger entries, the transaction lifecycle (`PENDING`, `POSTED`, `FAILED`, `REFUNDED`), Bean Validation, problem+json error responses, OpenAPI/Swagger documentation, Docker Compose for PostgreSQL, and a JUnit 5 + Testcontainers integration test suite.
+Features: account creation, payments, full refunds, transaction lookup with ledger entries, the transaction lifecycle (`PENDING`, `POSTED`, `FAILED`, `REFUNDED`), Bean Validation, problem+json error responses, OpenAPI/Swagger documentation, Docker Compose for PostgreSQL and the API, and a JUnit 5 + Testcontainers integration test suite.
+
+Operational layer (§19):
+- health and probe endpoints
+- Prometheus metrics: HTTP request volume, latency histograms and status/outcome, plus payment-domain counters
+- a repeatable k6 load test that verifies correctness and checks the ledger in PostgreSQL afterwards
+- a scripted restart/recovery check that replaces the API and PostgreSQL containers
 
 ## 2. Architecture and technology stack
 
@@ -31,8 +45,10 @@ Features: account creation, payments, full refunds, transaction lookup with ledg
 | JDBC driver | PostgreSQL JDBC | 42.7.11 |
 | API docs | springdoc-openapi (Swagger UI) | 2.8.17 |
 | Tests | JUnit 5, AssertJ, Spring Boot Test, Testcontainers | Testcontainers 1.21.4 |
+| Metrics | Micrometer + Prometheus registry (via Spring Boot Actuator) | 1.15.12 |
+| Load testing | k6 (Docker image `grafana/k6`) | 1.8.1 |
 | Build | Maven via Maven Wrapper | Maven 3.9.11, wrapper 3.3.4 |
-| Local infra | Docker Compose | `compose.yaml` |
+| Local infra | Docker Compose (PostgreSQL + API), multi-stage `Dockerfile` | `compose.yaml` |
 
 ### Layered architecture
 
@@ -51,7 +67,7 @@ HTTP ──► controller/   AccountController, TransactionController
        PostgreSQL      schema, constraints and triggers owned by Flyway (V1__create_ledger_schema.sql)
 
 cross-cutting: dto/ (request/response records), exception/ (ApiException, GlobalExceptionHandler),
-               config/ (OpenAPI metadata)
+               config/ (OpenAPI metadata), metrics/ (LedgerMetrics: Micrometer counters)
 ```
 
 Design properties:
@@ -64,10 +80,11 @@ Design properties:
 
 | Item | Count |
 |---|---|
-| Main Java source files | 27 (1,215 lines) |
-| Test Java source files | 5 (633 lines) |
+| Main Java source files | 28 (1,303 lines) |
+| Test Java source files | 7 (874 lines) |
 | Flyway SQL migration | 1 file (104 lines) |
-| Integration test cases | 27 |
+| Integration test cases | 33 |
+| Operational tooling | `load-test/ledger-load.js` (288 lines), 3 bash scripts (307 lines), `Dockerfile`, `compose.yaml` |
 
 ## 3. API endpoints
 
@@ -80,7 +97,10 @@ Confirmed at runtime from `/v3/api-docs`: `/accounts`, `/accounts/{id}`, `/trans
 | `POST` | `/transactions` | `Idempotency-Key` (required) | `201` new · `200` replay | Create a payment |
 | `GET` | `/transactions/{id}` | – | `200` | Transaction with its ledger entries |
 | `POST` | `/transactions/{id}/refund` | `Idempotency-Key` (required) | `201` new · `200` replay | Fully refund a posted payment |
-| `GET` | `/actuator/health` | – | `200` | Health check |
+| `GET` | `/actuator/health` | – | `200` | Health, with component status (`db`, `diskSpace`, …) |
+| `GET` | `/actuator/health/liveness`, `/actuator/health/readiness` | – | `200` | Kubernetes-style probes (used by the Compose healthcheck) |
+| `GET` | `/actuator/prometheus` | – | `200` | Prometheus-format metrics (added in 1.1) |
+| `GET` | `/actuator/metrics[/{name}]` | – | `200` | JSON metric browser (added in 1.1) |
 
 Every create/refund response carries an `Idempotent-Replayed: true|false` header. Monetary values are serialized as strings with four decimal places (`"100.0000"`) so that JSON clients never handle them as floats.
 
@@ -241,13 +261,17 @@ Tested responses include: negative amount, 5-decimal amount, lowercase currency,
 
 ## 11. Docker setup
 
-`compose.yaml` runs one `postgres:16-alpine` service (`ledger-postgres`) with:
-- database, user and password all set to `ledger`
-- a named volume `ledger-data`
-- a `pg_isready` healthcheck, so `docker compose up -d --wait` blocks until PostgreSQL is ready
-- a host port of `${POSTGRES_PORT:-5432}`, configurable in case 5432 is already in use
+`compose.yaml` defines the project `idempotent-payment-ledger` with two services:
 
-Verified: `docker compose up -d --wait` reported the container `Healthy`. The packaged jar connected to it, Flyway migrated it, and the application started ("Started LedgerApplication in 2.388 seconds").
+| Service | Image | Details |
+|---|---|---|
+| `postgres` | `postgres:16-alpine` | db/user/password `ledger`; named volume `ledger-data`; `pg_isready` healthcheck; published on `127.0.0.1:${POSTGRES_PORT:-5432}` |
+| `api` | built from the multi-stage `Dockerfile` | build stage `eclipse-temurin:21-jdk` (Maven wrapper, BuildKit cache for `~/.m2`); runtime stage `eclipse-temurin:21-jre` as the non-root `ubuntu` user; waits for a healthy Postgres; healthcheck on `/actuator/health/readiness`; published on `127.0.0.1:${API_PORT:-8080}` |
+
+- Both ports bind to localhost only.
+- `docker compose up -d --build --wait` returns once both healthchecks pass.
+- `docker compose up -d postgres` still supports running the API on the host.
+- Verified on 2026-10-07: both services reached `(healthy)`, and `/actuator/health` reported `db: UP`. Details are in §19.
 
 ## 12. JUnit 5 and Testcontainers testing
 
@@ -256,7 +280,7 @@ Verified: `docker compose up -d --wait` reported the container `Healthy`. The pa
 - **Isolation:** each test creates its own accounts and random idempotency keys, so no cleanup is needed, and the append-only trigger never has to be bypassed.
 - **Concurrency harness:** `runConcurrently(n, task)` uses a fixed thread pool plus ready/go `CountDownLatch`es, so all requests are released at the same moment.
 
-### Test inventory (27 tests)
+### Test inventory (33 tests)
 
 **`IdempotencyIntegrationTest` (9)**
 - `duplicateRequestWithSameKeyReturnsOriginalTransactionWithoutPostingTwice`
@@ -291,6 +315,16 @@ Verified: `docker compose up -d --wait` reported the container `Healthy`. The pa
 - `nonPositiveAmountsAreRejected`
 - `openApiDocumentIsServed`
 
+**`MetricsIntegrationTest` (5)**, added in 1.1. It runs with `@AutoConfigureObservability(tracing = false)`, because Spring Boot disables metrics export in tests by default.
+- `paymentOutcomesAreCountedByOutcome`
+- `refundOutcomesAreCounted`
+- `concurrentSameKeyBurstCountsOnePostedAndTheRestReplayed` (10 threads: `posted` +1, `replayed` +9)
+- `prometheusEndpointExposesHttpAndLedgerMetricsWithoutSensitiveValues`
+- `healthEndpointReportsDatabaseAndProbes`
+
+**`ApplicationRestartIntegrationTest` (1)**, added in 1.1
+- `idempotencyKeyAndLedgerSurviveAnApplicationRestart`: one standalone application instance creates a payment and is shut down; a new instance against the same database replays the request and gets the same id, still 1 row and 2 entries.
+
 ## 13. OpenAPI / Swagger
 
 - springdoc-openapi 2.8.17. An `OpenApiConfig` bean provides the title, version and description. Controllers are annotated with `@Tag`, `@Operation`, `@ApiResponse` and `@Parameter` (the `Idempotency-Key` is documented as required), and DTOs with `@Schema` examples.
@@ -311,7 +345,7 @@ Verified: `docker compose up -d --wait` reported the container `Healthy`. The pa
 
 ## 15. Exact final test and build results
 
-**Command:**
+**Command (final run, 2026-10-07):**
 
 ```
 ./mvnw -B clean verify
@@ -322,43 +356,38 @@ Run in an `eclipse-temurin:21-jdk` container with the Docker socket mounted, so 
 **Output (verbatim excerpts):**
 
 ```
-[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.536 s -- in io.github.omerbar4.paymentledger.TransactionLedgerIntegrationTest
-[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.229 s -- in io.github.omerbar4.paymentledger.DatabaseConstraintsIntegrationTest
-[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.286 s -- in io.github.omerbar4.paymentledger.IdempotencyIntegrationTest
-[INFO] Tests run: 27, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.028 s -- in io.github.omerbar4.paymentledger.MetricsIntegrationTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.282 s -- in io.github.omerbar4.paymentledger.TransactionLedgerIntegrationTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.233 s -- in io.github.omerbar4.paymentledger.DatabaseConstraintsIntegrationTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.348 s -- in io.github.omerbar4.paymentledger.IdempotencyIntegrationTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.897 s -- in io.github.omerbar4.paymentledger.ApplicationRestartIntegrationTest
+[INFO] Tests run: 33, Failures: 0, Errors: 0, Skipped: 0
 [INFO] Building jar: /app/target/idempotent-payment-ledger-1.0.0.jar
 [INFO] BUILD SUCCESS
-[INFO] Total time:  8.877 s
-[INFO] Finished at: 2026-09-30T04:10:50Z
+[INFO] Total time:  11.793 s
+[INFO] Finished at: 2026-10-07T05:46:38Z
 ```
 
 **Results:**
 
 | Metric | Result |
 |---|---|
-| Tests run | **27** |
+| Tests run | **33** (the 27 pre-existing tests are unchanged, plus 6 new ones) |
 | Failures / Errors / Skipped | **0 / 0 / 0** |
 | Build | **BUILD SUCCESS** (exit code 0) |
-| Artifact | `target/idempotent-payment-ledger-1.0.0.jar` (60,542,428 bytes, executable Spring Boot jar) |
-| Test database | PostgreSQL 16.15 via Testcontainers 1.21.4 |
+| Artifact | `target/idempotent-payment-ledger-1.0.0.jar` (62,935,349 bytes, executable Spring Boot jar) |
+| Test database | PostgreSQL 16 via Testcontainers 1.21.4 |
 | Application ERROR/WARN log lines during the test run | 0 (excluding springdoc's informational "enabled by default" notices and the JDK's Mockito agent notice) |
 
-The concurrency-focused test classes (`IdempotencyIntegrationTest`, `TransactionLedgerIntegrationTest`) were also run 3 additional times during development. All 21 of their tests passed on every run.
+**Baseline before the 1.1 changes.** The same command was run on the unmodified repository on 2026-10-07: `Tests run: 27, Failures: 0, Errors: 0, Skipped: 0`, `BUILD SUCCESS`.
 
-**Runtime smoke test.** The packaged jar was run against Docker Compose PostgreSQL and called with curl:
+**Historical (1.0, 2026-09-30).** The concurrency test classes were rerun 3 extra times, and all passed each time. The packaged jar was smoke-tested against Compose PostgreSQL with curl:
+- first payment `201`, replay `200`, key reuse `422`
+- refund `201`, after which the payment showed `REFUNDED` and the balances were restored
+- missing key `400`
+- Swagger UI and `/v3/api-docs` returned `200`
 
-| Check | Observed |
-|---|---|
-| `GET /actuator/health` | `{"status":"UP"}` |
-| First `POST /transactions` | `201`, `Idempotent-Replayed: false`, `POSTED`, DEBIT + CREDIT entries |
-| Same key, same body | `200`, `Idempotent-Replayed: true` |
-| Same key, different body | `422 IDEMPOTENCY_KEY_REUSED` |
-| Recipient balance after payment | `"100.0000"` |
-| `POST /transactions/{id}/refund` | `201`, `REFUND`, `POSTED`, reversing entries |
-| Original payment after refund | `REFUNDED` |
-| Recipient balance after refund | `"0.0000"` |
-| `POST /transactions` without key | `400 MISSING_HEADER` |
-| `/swagger-ui.html` · `/v3/api-docs` | `200` · `200` |
+The 1.1 runs in §19 supersede this as the current runtime evidence.
 
 ## 16. Project structure
 
@@ -366,7 +395,14 @@ The concurrency-focused test classes (`IdempotencyIntegrationTest`, `Transaction
 .
 ├── FINAL_PROJECT_REPORT.md
 ├── README.md
-├── compose.yaml                         # PostgreSQL 16 for local development
+├── RUNBOOK.md                           # run / observe / load-test / restart-test / demo guide
+├── Dockerfile, .dockerignore            # multi-stage API image (JDK build -> JRE runtime, non-root)
+├── compose.yaml                         # project-scoped: postgres + api, ports on 127.0.0.1
+├── load-test/ledger-load.js             # k6 scenarios: payments, idempotency burst, refunds
+├── load-test/results/                   # k6 output (git-ignored)
+├── scripts/load-test.sh                 # k6 in Docker + DB verification
+├── scripts/verify-ledger.sh             # ledger invariants checked in PostgreSQL
+├── scripts/recovery-check.sh            # API + PostgreSQL container restart/durability check
 ├── pom.xml
 ├── mvnw, mvnw.cmd, .mvn/wrapper/        # Maven Wrapper (Maven 3.9.11)
 └── src
@@ -380,6 +416,7 @@ The concurrency-focused test classes (`IdempotencyIntegrationTest`, `Transaction
     │   │   ├── dto/{CreateAccountRequest, AccountResponse, CreateTransactionRequest,
     │   │   │        TransactionResponse, LedgerEntryResponse}.java
     │   │   ├── exception/{ApiException, GlobalExceptionHandler}.java
+    │   │   ├── metrics/LedgerMetrics.java
     │   │   ├── repository/{AccountRepository, LedgerTransactionRepository, LedgerEntryRepository,
     │   │   │               IdempotentInsertRepository, IdempotentInsertRepositoryImpl}.java
     │   │   └── service/{AccountService, TransactionService, RequestFingerprint,
@@ -392,7 +429,9 @@ The concurrency-focused test classes (`IdempotencyIntegrationTest`, `Transaction
         ├── AbstractIntegrationTest.java
         ├── IdempotencyIntegrationTest.java
         ├── TransactionLedgerIntegrationTest.java
-        └── DatabaseConstraintsIntegrationTest.java
+        ├── DatabaseConstraintsIntegrationTest.java
+        ├── MetricsIntegrationTest.java
+        └── ApplicationRestartIntegrationTest.java
 ```
 
 ## 17. Known limitations
@@ -406,7 +445,12 @@ These are intentional scope boundaries of the finished project:
 - **`PENDING` is internal only.** It exists only inside the creating database transaction and isn't observable through the API.
 - **No idempotency for account creation.** `POST /accounts` doesn't take an idempotency key.
 - **No listing or pagination endpoints.** Transactions and accounts can only be retrieved by id.
-- **Integration tests only.** All 27 tests are full-stack integration tests; there is no separate unit-test layer.
+- **Integration tests only.** All 33 tests are full-stack integration tests; there is no separate unit-test layer.
+- **Operational validation is local only** (§19.4):
+  - Load-test numbers come from one laptop, one API instance and one PostgreSQL container. They show correctness under concurrency, not capacity.
+  - No multi-instance or load-balanced setup was tested.
+  - Metrics are exposed for scraping, but no Prometheus server, dashboards or alerts are included.
+  - Actuator endpoints are unauthenticated and share the application port.
 - **Package naming.** The Java package and Maven `groupId` are `io.github.omerbar4.paymentledger`.
 
 ## 18. Résumé evidence
@@ -418,13 +462,126 @@ These are intentional scope boundaries of the finished project:
 | Double-entry ledger invariant enforced by PostgreSQL | `trg_ledger_entries_balanced` (deferred), `trg_ledger_entries_append_only` | `unbalancedEntriesAreRejectedAtCommit`, `ledgerEntriesAreAppendOnly`, `ledgerIsGloballyBalancedAndBalancesMatchEntries` |
 | No overdrafts under concurrency | `findAllByIdForUpdate` (ordered `FOR UPDATE`), `chk_accounts_non_negative_balance` | `concurrentPaymentsNeverOverdrawAnAccount` (20 threads → 10 posted / 10 failed, balance 0) |
 | Exactly-once refunds | `findByIdForUpdate` on the original, partial unique index | `concurrentRefundsWithDifferentKeysRefundExactlyOnce` (10 threads → 1 × 201, 9 × 409) |
-| Testcontainers integration suite | `TestcontainersConfiguration`, `AbstractIntegrationTest` | 27 / 27 passing against PostgreSQL 16.15 |
+| Testcontainers integration suite | `TestcontainersConfiguration`, `AbstractIntegrationTest` | 33 / 33 passing against PostgreSQL 16 |
+| HTTP + domain metrics without sensitive tags | `LedgerMetrics`, `application.yml` (`management.*`) | `MetricsIntegrationTest` (5 tests); live scrape in §19 |
+| Idempotency survives API and DB restarts | key stored in PostgreSQL; named volume | `ApplicationRestartIntegrationTest`; `scripts/recovery-check.sh` run (§19) |
+| Same-key burst under load → one transaction | as above | k6 `idempotency_burst` (20 concurrent → 1 × 201, 19 × 200, 1 id) + `verify-ledger.sh` |
 
 ### Strongest résumé bullets
 
 - **Built an idempotent payment ledger REST API in Java 21, Spring Boot 3.5 and PostgreSQL.** Idempotency is enforced at the database level with a unique constraint and `INSERT … ON CONFLICT DO NOTHING` in the same transaction as the ledger writes; verified that 16 concurrent requests with the same key produce exactly one transaction.
 - **Enforced double-entry accounting invariants in PostgreSQL** with a deferred constraint trigger (debits = credits at commit), an append-only ledger trigger, and CHECK/partial-unique constraints. Pessimistic row locks taken in a fixed order prevent overdrafts and double refunds under concurrent load.
-- **Wrote 27 JUnit 5 + Testcontainers integration tests** against real PostgreSQL covering duplicate and concurrent idempotency keys, race conditions (20 parallel payments never overdraw an account; 10 parallel refunds succeed exactly once), validation, RFC 9457 error handling, and database-level constraint enforcement.
+- **Wrote 33 JUnit 5 + Testcontainers integration tests** against real PostgreSQL covering duplicate and concurrent idempotency keys, race conditions (20 parallel payments never overdraw an account; 10 parallel refunds succeed exactly once), validation, RFC 9457 error handling, and database-level constraint enforcement.
+
+### Optional additional wording
+
+*Supported only after the listed commands pass.* All three commands passed on 2026-10-07 (§19); re-run them before relying on this wording.
+
+- Added operational validation to the ledger API: Micrometer/Prometheus metrics (HTTP latency histograms, status outcomes, transaction-outcome counters) and a k6 load test. In the test, 20 concurrent same-key requests produced exactly one transaction, confirmed by a PostgreSQL ledger-invariant check. A Docker restart script showed that idempotent replays and balanced postings survive API and database container replacement.
+  - Commands: `./mvnw clean verify`, `scripts/load-test.sh`, `scripts/recovery-check.sh`.
+
+## 19. Operational validation (1.1)
+
+### 19.1 Implemented
+
+| Area | Implementation |
+|---|---|
+| Health | `/actuator/health` (shows component status: `db`, `diskSpace`, …; no details), `/actuator/health/liveness`, `/actuator/health/readiness` |
+| Metrics | `/actuator/prometheus` (Prometheus text format) and `/actuator/metrics`. HTTP: `http_server_requests_seconds_{count,sum,max,bucket}` tagged `method`, templated `uri`, `status`, `outcome`, `exception`; histogram bounded to 1 ms–5 s. Common tag `application`. |
+| Domain counters | `LedgerMetrics`: `ledger_transactions_total{type=payment\|refund, outcome=posted\|failed\|replayed}`, incremented in the controller after the service's transaction commits; `ledger_api_errors_total{code}`, incremented by `GlobalExceptionHandler` for every problem+json response. All tag values come from fixed sets; there are no ids, keys or amounts. |
+| Log hygiene | The constraint-violation warning logs only the first line of the PostgreSQL message. The `Detail:` line, which echoes row values such as idempotency keys, is dropped. |
+| Container | Multi-stage `Dockerfile`; `api` service in Compose with a readiness healthcheck; localhost-only ports |
+| Load test | `load-test/ledger-load.js` (k6 1.8.1, via `scripts/load-test.sh`). Scenarios: `payments`, `idempotency_burst` (`http.batch` of identical same-key requests), `refunds`. Response bodies are checked, not only status codes. Thresholds: checks 100 %, `http_req_failed` 0 %, burst = 1 created / N−1 replayed / 1 id, payment p95 < 1000 ms |
+| DB verifier | `scripts/verify-ledger.sh [key]`: psql via `docker compose exec`, with the key passed as a psql variable. Checks the key's single row and balanced pair, plus global invariants: no duplicate keys, no unbalanced transactions, 2 entries per posted/refunded transaction, none for failed ones, no `PENDING`, balances = entries, Σ debits = Σ credits |
+| Restart check | `scripts/recovery-check.sh`: isolated Compose project `ledger-recovery-check` (ports 18080/55433). Recreates the API container, then the PostgreSQL container (same volume), asserting at each step. Prints diagnostics on failure and removes only its own project's resources |
+
+The public business API is unchanged; the only additions are read-only actuator endpoints. The service, repositories, domain model and migration are unchanged. Two existing classes were touched:
+- `TransactionController` now receives `LedgerMetrics` and records the committed result.
+- `GlobalExceptionHandler` now counts error codes and logs only the first line of constraint messages.
+
+### 19.2 Commands run and observed results (2026-10-07)
+
+| # | Command | Observed |
+|---|---|---|
+| 1 | `./mvnw -B clean verify` (before changes) | 27 run, 0 failures / 0 errors / 0 skipped, `BUILD SUCCESS` |
+| 2 | `./mvnw -B clean verify` (final) | 33 run, 0 / 0 / 0, `BUILD SUCCESS` (§15) |
+| 3 | `POSTGRES_PORT=55432 docker compose up -d --build --wait` | `postgres` and `api` both `(healthy)`. 5432 was occupied by an unrelated local project, hence the override |
+| 4 | `curl localhost:8080/actuator/health` | `{"status":"UP", … "db":{"status":"UP"} …}`; readiness `{"status":"UP"}` |
+| 5 | `curl localhost:8080/actuator/prometheus` | HTTP 200, `text/plain;version=0.0.4`; `http_server_requests_seconds_*` series per templated URI/status; `ledger_*` counters (snapshot below); no load-test key found in the scrape |
+| 6 | `scripts/load-test.sh` (defaults) | k6 exit 0, verifier exit 0 (output below) |
+| 7 | `/bin/bash scripts/recovery-check.sh` | every step PASS, exit 0, 28 s; no `ledger-recovery-check` containers or volumes left afterwards |
+| 8 | `RECOVERY_API_PORT=8080 /bin/bash scripts/recovery-check.sh` (deliberate port clash) | exit 1, names the failing step, prints the Docker error and container logs, cleans up; the main stack stayed healthy |
+| 9 | `RECOVERY_PROJECT=idempotent-payment-ledger /bin/bash scripts/recovery-check.sh` (pre-commit review fix) | exit 2: refuses any project name not starting with `ledger-recovery-check`, because the script runs `down -v` on that project; existing volumes untouched. Full recovery check re-run afterwards: exit 0, 0 FAIL lines, no leftovers |
+
+**Load test, final run with defaults** (`VUS=5 DURATION=30s SLEEP_SECONDS=0.1 BURST_SIZE=20 REFUND_ITERATIONS=5`):
+
+```
+HTTP requests   total=1536  rate=51.0/s
+                succeeded=1536  failed(unexpected status)=0
+Latency, all    avg=9.10ms  p50=8.18ms  p(90)=15.22ms  p(95)=18.71ms  p(99)=35.11ms  max=100.10ms
+Latency, payments scenario  avg=9.17ms  p50=8.21ms  p(90)=15.21ms  p(95)=18.88ms  p(99)=36.11ms  max=100.10ms
+Payments created (all checks passed): 1346
+Payment retries replayed:             135
+Refund cycles completed:              5 / 5
+Idempotency burst: 20 concurrent identical requests, one key
+                   201 created=1  200 replayed=19  other=0  distinct transaction ids=1  => PASS
+Checks: 5824 passed, 0 failed
+Overall: PASS        (all 7 thresholds PASS)
+
+Key-specific checks:  1 transaction for the key, POSTED, 2 entries, debits = credits = 25.0000   (all PASS)
+Global checks (30994 transactions, 61988 ledger entries): every invariant PASS
+Ledger verification: PASS
+```
+
+An earlier run used no think time (`SLEEP_SECONDS` didn't exist yet). It passed all checks and thresholds as well: 32,647 requests, 0 failed, p95 12.04 ms, burst 1/19/1, ledger verification PASS. Because it generated about 30k rows per run, the default was changed to a 0.1 s pause per iteration. The database totals above include both runs: 29,637 + 1,357 = 30,994 transactions.
+
+**Metrics reconcile with the database.** The cumulative counters after both runs:
+
+```
+ledger_transactions_total{outcome="posted",type="payment"} 30984.0
+ledger_transactions_total{outcome="posted",type="refund"} 10.0
+ledger_transactions_total{outcome="replayed",type="payment"} 3139.0
+ledger_transactions_total{outcome="replayed",type="refund"} 10.0
+ledger_transactions_total{outcome="failed",…} 0.0
+ledger_api_errors_total{code="TRANSACTION_ALREADY_REFUNDED"} 10.0
+http_server_requests_seconds_count{method="POST",…status="201",uri="/transactions"} 30984
+```
+
+Posted payments plus posted refunds (30,984 + 10) equal the 30,994 transaction rows counted by `verify-ledger.sh`. The replay count (3,139) equals the 3,101 k6 retries (2,966 + 135) plus 38 burst replays (19 per run).
+
+**Restart/recovery run** (abridged; every line printed `PASS`):
+
+```
+postgres and api containers are healthy
+POST /transactions -> 201, status POSTED, Idempotent-Replayed: false
+[DB] 1 transaction for the key, POSTED, 2 entries, debits = credits = 75.5000; global invariants hold
+api container replaced (f00de5f483ee -> f608574951d5) and healthy
+POST with the same key -> 200, Idempotent-Replayed: true, same transaction id
+GET /transactions/{id} -> POSTED with 2 ledger entries
+[DB] still 1 transaction / 2 entries for the key
+postgres container replaced (c584531c4be2 -> 3579d132754d) and healthy
+API reconnected to the new PostgreSQL container without being restarted
+POST with the same key -> 200 replay of the same transaction
+new payment with a new key -> 201 POSTED (writes work after the restart)
+customer balance is 76.5000 (75.50 once, not twice, plus 1.00)
+[DB] 2 transactions, 4 entries, every invariant PASS
+Recovery check PASSED
+```
+
+### 19.3 Same-key duplicate protection: final check
+
+Three independent sources confirm that a duplicate key produces one transaction and one balanced posting:
+- the automated suite: `IdempotencyIntegrationTest` with 16 threads, and `MetricsIntegrationTest` with 10 threads (+1 posted, +9 replayed)
+- the k6 burst (20 concurrent requests) followed by `verify-ledger.sh` on that key: 1 row, 2 entries, 25.0000 = 25.0000
+- the recovery check, where the same key was replayed across both container replacements and stayed at 1 row and 2 entries
+
+### 19.4 Not verified / out of scope
+
+- **Capacity and production behaviour.** No sustained, soak or multi-instance testing was done, and no production-like hardware was used. The latency figures apply to this laptop only.
+- **Observability backend.** There is no Prometheus server, Grafana or alerting. Percentiles in this report come from k6; the exported histogram buckets were checked for presence, not queried through PromQL.
+- **Durability boundary.** PostgreSQL was restarted with Docker's normal stop, which shuts down cleanly. No hard kill, crash or `fsync`-loss scenario was tested.
+- **Restart coverage.** The scripted restarts replace one container at a time. No in-flight requests were interrupted mid-transaction by a restart (the atomic-commit design covers that case, but it wasn't exercised here).
+- **Linux.** The scripts were run on macOS with `/bin/bash` 3.2 and Docker Desktop. They are written for Linux too (`host-gateway` mapping, no GNU-only flags), but were not executed there.
 
 ---
 
@@ -455,6 +612,16 @@ These are intentional scope boundaries of the finished project:
 | 21 | `BigDecimal` / `NUMERIC(19,4)` money handling, 4-dp precision | Code audit + `paymentPostsBalancedDebitAndCreditEntries` (`12.3456`) | **PASS** |
 | 22 | OpenAPI document and Swagger UI served | `openApiDocumentIsServed`, runtime `200`/`200` | **PASS** |
 | 23 | Docker Compose PostgreSQL starts healthy and the app runs against it | Runtime smoke test | **PASS** |
-| 24 | JUnit 5 + Testcontainers suite | 27 run, 0 failures, 0 errors, 0 skipped | **PASS** |
+| 24 | JUnit 5 + Testcontainers suite | 33 run, 0 failures, 0 errors, 0 skipped | **PASS** |
+| 25 | Health endpoint with db component, liveness and readiness probes | `healthEndpointReportsDatabaseAndProbes`; live `curl` | **PASS** |
+| 26 | Prometheus metrics: HTTP count, latency histogram, status/outcome; no sensitive values | `prometheusEndpointExposesHttpAndLedgerMetricsWithoutSensitiveValues`; live scrape | **PASS** |
+| 27 | Ledger counters accurate (posted / failed / replayed, error codes), including under concurrency | `MetricsIntegrationTest` (3 counter tests); counters reconcile with DB row count | **PASS** |
+| 28 | Containerized API: Compose stack starts healthy | `docker compose up -d --build --wait` | **PASS** |
+| 29 | k6 load test: response correctness, 0 unexpected statuses, latency percentiles reported | `scripts/load-test.sh` (5,824 / 5,824 checks, 7 / 7 thresholds) | **PASS** |
+| 30 | Concurrent same-key burst → exactly one transaction, no duplicate ledger entries | k6 burst (1 × 201, 19 × 200, 1 id) + `verify-ledger.sh` key checks | **PASS** |
+| 31 | Ledger invariants hold after load (balanced, balances = entries, no PENDING) | `verify-ledger.sh` global checks | **PASS** |
+| 32 | Idempotent replay survives application restart (automated) | `ApplicationRestartIntegrationTest` | **PASS** |
+| 33 | Replay and ledger survive API container replacement, then PostgreSQL container replacement; API reconnects | `scripts/recovery-check.sh` | **PASS** |
+| 34 | Recovery script fails loudly and cleans up only its own resources | Deliberate port-clash run (exit 1 + diagnostics, no leftovers, main stack untouched) | **PASS** |
 
 **Overall project status: COMPLETED**

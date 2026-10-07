@@ -1,5 +1,6 @@
 package io.github.omerbar4.paymentledger.exception;
 
+import io.github.omerbar4.paymentledger.metrics.LedgerMetrics;
 import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
@@ -30,6 +31,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    private final LedgerMetrics metrics;
+
+    public GlobalExceptionHandler(LedgerMetrics metrics) {
+        this.metrics = metrics;
+    }
+
     @ExceptionHandler(ApiException.class)
     ResponseEntity<ProblemDetail> handleApiException(ApiException ex) {
         return problem(ex.getStatus(), ex.getCode(), ex.getMessage());
@@ -37,7 +44,9 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     ResponseEntity<ProblemDetail> handleDataIntegrity(DataIntegrityViolationException ex) {
-        log.warn("Database constraint rejected a write: {}", ex.getMostSpecificCause().getMessage());
+        // Only the first line: PostgreSQL's "Detail:" line echoes row values (e.g. idempotency keys).
+        String cause = String.valueOf(ex.getMostSpecificCause().getMessage()).lines().findFirst().orElse("");
+        log.warn("Database constraint rejected a write: {}", cause);
         return problem(HttpStatus.CONFLICT, "CONSTRAINT_VIOLATION",
                 "The request conflicts with the current state of the ledger.");
     }
@@ -91,6 +100,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
             problem.setProperty("code", ex instanceof MissingRequestHeaderException
                     ? "MISSING_HEADER"
                     : "REQUEST_ERROR");
+            metrics.recordApiError((String) problem.getProperties().get("code"));
         }
         return response;
     }
@@ -100,6 +110,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         problem.setTitle("Bad Request");
         problem.setProperty("code", "VALIDATION_FAILED");
         problem.setProperty("errors", errors);
+        metrics.recordApiError("VALIDATION_FAILED");
         return ResponseEntity.badRequest().body(problem);
     }
 
@@ -107,7 +118,8 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return Map.of("field", field, "message", message == null ? "invalid" : message);
     }
 
-    private static ResponseEntity<ProblemDetail> problem(HttpStatus status, String code, String detail) {
+    private ResponseEntity<ProblemDetail> problem(HttpStatus status, String code, String detail) {
+        metrics.recordApiError(code);
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
         problem.setTitle(status.getReasonPhrase());
         problem.setProperty("code", code);

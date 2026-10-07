@@ -2,6 +2,7 @@ package io.github.omerbar4.paymentledger.controller;
 
 import io.github.omerbar4.paymentledger.dto.CreateTransactionRequest;
 import io.github.omerbar4.paymentledger.dto.TransactionResponse;
+import io.github.omerbar4.paymentledger.metrics.LedgerMetrics;
 import io.github.omerbar4.paymentledger.service.TransactionResult;
 import io.github.omerbar4.paymentledger.service.TransactionService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -32,9 +33,11 @@ public class TransactionController {
     public static final String IDEMPOTENT_REPLAYED = "Idempotent-Replayed";
 
     private final TransactionService transactionService;
+    private final LedgerMetrics metrics;
 
-    public TransactionController(TransactionService transactionService) {
+    public TransactionController(TransactionService transactionService, LedgerMetrics metrics) {
         this.transactionService = transactionService;
+        this.metrics = metrics;
     }
 
     @PostMapping
@@ -71,7 +74,9 @@ public class TransactionController {
         return TransactionResponse.from(result.transaction(), result.entries());
     }
 
-    private static ResponseEntity<TransactionResponse> respond(TransactionResult result) {
+    private ResponseEntity<TransactionResponse> respond(TransactionResult result) {
+        // The service call has returned, so its database transaction has committed.
+        metrics.recordTransaction(result);
         TransactionResponse body = TransactionResponse.from(result.transaction(), result.entries());
         if (result.replayed()) {
             return ResponseEntity.status(HttpStatus.OK).header(IDEMPOTENT_REPLAYED, "true").body(body);
