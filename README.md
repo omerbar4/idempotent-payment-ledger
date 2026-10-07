@@ -194,3 +194,7 @@ All of this is local validation. It is not a deployed service and not a capacity
 ## Deliberate scope limits
 
 No authentication or multi-tenancy, so idempotency keys are global. In production they would be scoped per client and expired after a retention window. Refunds are full refunds only, and there is no currency conversion. The actuator endpoints are unauthenticated and served on the application port, which suits local use only.
+
+## License
+
+[MIT](LICENSE) © 2026 Omer Bar
